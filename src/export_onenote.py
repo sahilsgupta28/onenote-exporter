@@ -14,6 +14,8 @@ Options:
   -o DIR      parent folder for the export (default: current folder)
   --utc       show dates in UTC instead of local time
   --no-ink    do not ask Graph for handwriting (InkML)
+  --ink-layout canvas|end   html pages with handwriting: canvas (default) draws it over
+              the text boxes at OneNote's positions, end shows it below the text
   --ocr       run local OCR (needs the `tesseract` program) on downloaded images
   --render M  save pages as PDF/PNG: auto = pages with handwriting, OCR text or only
               images (default), all, or none (needs Chrome/Chromium/Edge/Brave;
@@ -54,6 +56,7 @@ import hashlib
 import html
 import io
 import json
+import math
 import mimetypes
 import os
 import re
@@ -110,7 +113,8 @@ class TokenExpired(StopRun):
     pass
 
 
-OPTS = {"utc": False, "ink": True, "ocr": False, "render": "auto", "render_as": "pdf"}
+OPTS = {"utc": False, "ink": True, "ocr": False, "render": "auto", "render_as": "pdf",
+        "ink_layout": "canvas"}
 RUN = {"kind": "", "id": ""}
 CTX = {"section": None, "page": None}      # (name, id) / page entry, used when logging errors
 INK_STATE = {"unsupported": False}
@@ -178,9 +182,17 @@ class ErrorLog:
             try:
                 with open(self.path, newline="", encoding="utf-8-sig") as f:
                     rows = list(csv.reader(f))
-                self.prior = [r for r in rows[1:] if len(r) == len(ERROR_HEADER)]
+                self.prior = [r for r in rows[1:] if len(r) == len(ERROR_HEADER)
+                              and not self.obsolete(r)]
             except OSError:
                 self.prior = []
+
+    @staticmethod
+    def obsolete(row):
+        """Notes written by older versions for every page, which were not real problems."""
+        return (row[1] == "format" and row[7] == "ink"
+                and (row[9].startswith("InkML has no drawable strokes")
+                     or "handwriting part(s) saved as InkML" in row[9]))
 
     @staticmethod
     def key(row):
@@ -740,74 +752,252 @@ def decode_trace(text, xi, yi):
             else:
                 s["d"] += num
                 s["v"] += s["d"]
-        pts.append((state[xi]["v"], state[yi]["v"]))
+        x, y = state[xi]["v"], state[yi]["v"]
+        if math.isfinite(x) and math.isfinite(y):
+            pts.append((x, y))
     return pts
 
 
-def inkml_to_svg(data):
-    """Approximate SVG drawing of InkML strokes (None if there are no strokes)."""
+HIMETRIC_PX = 96 / 2540        # 1 himetric (1/1000 cm) in CSS pixels at 96 dpi
+UNIT_PX = {"himetric": HIMETRIC_PX, "mm": 96 / 25.4, "cm": 96 / 2.54, "in": 96.0,
+           "pt": 96 / 72, "pc": 16.0, "px": 1.0}
+INK_MARKER = "data-ink-render"     # present in html pages that already draw their handwriting inline
+
+
+def unit_px(units):
+    return UNIT_PX.get((units or "himetric").strip().lower(), HIMETRIC_PX)
+
+
+def brush_style(props):
+    """Colour, width (px) and opacity of a brush; props maps name -> (value, units)."""
+    def number(name):
+        value, units = props.get(name, (None, None))
+        try:
+            return float(value), units
+        except (TypeError, ValueError):
+            return None, units
+
+    color = (props.get("color") or ("", ""))[0] or "#000000"
+    if not re.match(r"^#[0-9a-fA-F]{3,8}$", color):
+        color = "#000000"
+    w, wu = number("width")
+    width = min(max(w * unit_px(wu), 0.8), 40.0) if w else 2.5
+    opacity = 1.0
+    t, _ = number("transparency")
+    if t is not None:
+        opacity = max(0.05, min(1.0, 1 - (t / 255 if t > 1 else t)))
+    if (props.get("rasterOp") or ("", ""))[0].lower() == "maskpen":      # highlighter
+        opacity = min(opacity, 0.45)
+    return {"color": color, "width": width, "opacity": opacity}
+
+
+def parse_inkml(data):
+    """Strokes of an InkML document, in page pixels (None when there are none: a page
+    without handwriting still comes with an empty InkML part)."""
+    if not data or not data.strip():
+        return None
     root = ET.fromstring(data)
     xml_id = "{http://www.w3.org/XML/1998/namespace}id"
-    brushes, channels = {}, []
+    brushes, channels, names = {}, {}, []
     for el in root.iter():
         name = _local(el.tag)
         if name == "brush":
-            props = {c.get("name"): c.get("value") for c in el if _local(c.tag) == "brushProperty"}
-            brushes[el.get(xml_id) or el.get("id") or ""] = props
-        elif name == "traceFormat" and not channels:
-            channels = [c.get("name") for c in el if _local(c.tag) == "channel"]
-    xi = channels.index("X") if "X" in channels else 0
-    yi = channels.index("Y") if "Y" in channels else 1
+            brushes[el.get(xml_id) or el.get("id") or ""] = {
+                c.get("name"): (c.get("value"), c.get("units"))
+                for c in el if _local(c.tag) == "brushProperty"}
+        elif name == "traceFormat" and not names:
+            for c in el:
+                if _local(c.tag) == "channel":
+                    names.append(c.get("name"))
+                    channels[c.get("name")] = c.get("units")
+    xi = names.index("X") if "X" in names else 0
+    yi = names.index("Y") if "Y" in names else 1
+    sx, sy = unit_px(channels.get("X")), unit_px(channels.get("Y"))
     strokes = []
     for el in root.iter():
-        if _local(el.tag) == "trace":
-            pts = decode_trace(el.text or "", xi, yi)
-            if pts:
-                strokes.append((pts, brushes.get((el.get("brushRef") or "").lstrip("#"), {})))
+        if _local(el.tag) != "trace":
+            continue
+        pts = [(x * sx, y * sy) for x, y in decode_trace(el.text or "", xi, yi)]
+        if pts:
+            style = brush_style(brushes.get((el.get("brushRef") or "").lstrip("#"), {}))
+            strokes.append(dict(style, pts=pts))
     if not strokes:
         return None
-    xs = [p[0] for pts, _ in strokes for p in pts]
-    ys = [p[1] for pts, _ in strokes for p in pts]
-    minx, miny = min(xs), min(ys)
-    w, h = max(max(xs) - minx, 1.0), max(max(ys) - miny, 1.0)
-    pad, sw = max(w, h) * 0.02, max(w, h) / 600
+    xs = [p[0] for s in strokes for p in s["pts"]]
+    ys = [p[1] for s in strokes for p in s["pts"]]
+    return {"strokes": strokes, "bbox": (min(xs), min(ys), max(xs), max(ys))}
+
+
+def ink_shapes(parsed, dx=0.0, dy=0.0):
+    """SVG elements for the strokes, shifted by (-dx, -dy)."""
     shapes = []
-    for pts, props in strokes:
-        color = props.get("color") or "#000000"
-        if not re.match(r"^#[0-9a-fA-F]{3,8}$", color):
-            color = "#000000"
+    for s in parsed["strokes"]:
+        pts, last = [], None
+        for x, y in s["pts"]:
+            p = (round(x - dx, 1), round(y - dy, 1))
+            if p != last:
+                pts.append(p)
+                last = p
+        op = f' opacity="{s["opacity"]:.2f}"' if s["opacity"] < 1 else ""
         if len(pts) == 1:
-            shapes.append(f'<circle cx="{pts[0][0]:g}" cy="{pts[0][1]:g}" r="{sw:g}" fill="{color}"/>')
+            shapes.append(f'<circle cx="{pts[0][0]}" cy="{pts[0][1]}" r="{s["width"] / 2:.1f}" '
+                          f'fill="{s["color"]}"{op}/>')
         else:
-            coords = " ".join(f"{x:g},{y:g}" for x, y in pts)
-            shapes.append(f'<polyline points="{coords}" fill="none" stroke="{color}" '
-                          f'stroke-width="{sw:g}" stroke-linecap="round" stroke-linejoin="round"/>')
-    vw, vh = w + 2 * pad, h + 2 * pad
-    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{minx - pad:g} {miny - pad:g} '
-            f'{vw:g} {vh:g}" width="800" height="{800 * vh / vw:.0f}">\n'
-            + "\n".join(shapes) + "\n</svg>\n")
+            coords = " ".join(f"{x},{y}" for x, y in pts)
+            shapes.append(f'<polyline points="{coords}" fill="none" stroke="{s["color"]}" '
+                          f'stroke-width="{s["width"]:.1f}" stroke-linecap="round" '
+                          f'stroke-linejoin="round"{op}/>')
+    return shapes
+
+
+def standalone_svg(parsed, inline=False):
+    """The handwriting alone, cropped to its bounding box (the ink/*.svg file, or the same
+    drawing embedded at the end of an html page)."""
+    x0, y0, x1, y1 = parsed["bbox"]
+    pad = 12.0
+    w, h = (x1 - x0) + 2 * pad, (y1 - y0) + 2 * pad
+    extra = (f' {INK_MARKER}="1" style="max-width:100%;height:auto;background:#fff"'
+             if inline else "")
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w:.1f} {h:.1f}" '
+            f'width="{w:.0f}" height="{h:.0f}"{extra}>\n'
+            '<rect width="100%" height="100%" fill="#ffffff"/>\n'
+            + "\n".join(ink_shapes(parsed, x0 - pad, y0 - pad)) + "\n</svg>\n")
+
+
+def overlay_svg(parsed, width, height, top=0):
+    """The handwriting in page coordinates, laid over a page canvas of this size."""
+    return (f'<svg class="ink-layer" {INK_MARKER}="1" xmlns="http://www.w3.org/2000/svg" '
+            f'viewBox="0 0 {width} {height}" width="{width}" height="{height}" '
+            f'style="top:{top}px" role="img" aria-label="Handwriting">\n'
+            + "\n".join(ink_shapes(parsed)) + "\n</svg>")
 
 
 def save_ink(inks, page_dir):
-    """Keep the raw InkML and an approximate SVG. Returns relative SVG paths."""
-    svgs = []
+    """Keep the handwriting: raw InkML + a standalone SVG per part. Returns None when the
+    page has no handwriting. Nothing is saved or logged for those pages: Graph sends an
+    empty InkML part with every page."""
+    parts = []
     for i, data in enumerate(inks, 1):
-        suffix = "" if len(inks) == 1 else f"-{i:02d}"
-        atomic_write(os.path.join(page_dir, "ink", f"ink{suffix}.inkml"), data, binary=True)
         try:
-            svg = inkml_to_svg(data)
-        except Exception as e:
-            ERRORS.add("format", "ink", f"InkML could not be converted to SVG ({e}); raw InkML kept")
+            parsed = parse_inkml(data)
+        except Exception as e:           # unreadable InkML: keep the evidence and say so
+            atomic_write(os.path.join(page_dir, "ink", f"unreadable-{i:02d}.inkml"), data,
+                         binary=True)
+            ERRORS.add("format", "ink", f"InkML could not be read ({e}); raw InkML kept in ink/")
             continue
-        if svg:
-            atomic_write(os.path.join(page_dir, "ink", f"ink{suffix}.svg"), svg)
-            svgs.append(f"ink/ink{suffix}.svg")
-        else:
-            ERRORS.add("format", "ink", "InkML has no drawable strokes; raw InkML kept")
-    if inks:
-        ERRORS.add("format", "ink", f"{len(inks)} handwriting part(s) saved as InkML + approximate "
-                   "SVG and shown at the end of the page; their original position is not reproduced")
-    return svgs
+        if parsed:
+            parts.append((data, parsed))
+    if not parts:
+        return None
+    svgs, merged = [], {"strokes": [], "bbox": None}
+    for n, (data, parsed) in enumerate(parts, 1):
+        suffix = "" if len(parts) == 1 else f"-{n:02d}"
+        atomic_write(os.path.join(page_dir, "ink", f"ink{suffix}.inkml"), data, binary=True)
+        svg = standalone_svg(parsed)
+        try:
+            ET.fromstring(svg)           # never write an SVG that browsers cannot open
+        except ET.ParseError as e:
+            ERRORS.add("format", "ink", f"generated SVG is not valid XML ({e}); raw InkML kept")
+            continue
+        atomic_write(os.path.join(page_dir, "ink", f"ink{suffix}.svg"), svg)
+        svgs.append(f"ink/ink{suffix}.svg")
+        merged["strokes"] += parsed["strokes"]
+        b, m = parsed["bbox"], merged["bbox"]
+        merged["bbox"] = b if m is None else (min(m[0], b[0]), min(m[1], b[1]),
+                                              max(m[2], b[2]), max(m[3], b[3]))
+    if not svgs:
+        return None
+    return {"svgs": svgs, "parsed": merged, "parts": [p for _, p in parts]}
+
+
+# --- page canvas: where OneNote placed the text boxes (px) and how big the page must be
+def _div_end(content, start):
+    depth = 1
+    for m in re.finditer(r"<div\b|</div\s*>", content[start:], flags=re.I):
+        depth += 1 if m.group(0)[1] != "/" else -1
+        if depth == 0:
+            return start + m.start()
+    return len(content)
+
+
+def estimate_height(inner, width):
+    te = TextExtractor()
+    te.feed(inner)
+    per_line = max(max(width or 400.0, 120.0) / 7.5, 10.0)
+    lines = sum(max(1, math.ceil(len(ln) / per_line)) for ln in te.result().splitlines() if ln.strip())
+    pictures = sum(float(h) for h in re.findall(
+        r'<img\b[^>]*\bheight\s*=\s*"(\d+(?:\.\d+)?)"', inner, flags=re.I))
+    return lines * 26 + pictures + 20
+
+
+def scan_abs_boxes(content):
+    """Absolutely positioned top-level boxes: left/top/width in px and an estimated height."""
+    boxes, upto = [], 0
+    for m in re.finditer(r"<div\b[^>]*>", content, flags=re.I | re.S):
+        if m.start() < upto:
+            continue                                 # nested in a box that is already counted
+        style = attr(m.group(0), "style") or ""
+        if not re.search(r"position\s*:\s*absolute", style, flags=re.I):
+            continue
+
+        def px(name):
+            mm = re.search(rf"(?<![\w-]){name}\s*:\s*(-?[\d.]+)\s*px", style, flags=re.I)
+            return float(mm.group(1)) if mm else None
+
+        left, top, width = px("left"), px("top"), px("width")
+        if left is None or top is None:
+            continue
+        end = _div_end(content, m.end())
+        boxes.append({"left": left, "top": top, "width": width,
+                      "height": estimate_height(content[m.end():end], width)})
+        upto = end
+    return boxes
+
+
+def canvas_layout(content, parsed, title):
+    """Size of the page canvas holding the text boxes and the handwriting. Everything is
+    moved down by `shift` px when needed so that it starts below the title and dates."""
+    boxes = scan_abs_boxes(content)
+    right = [b["left"] + (b["width"] or 400.0) for b in boxes] + [parsed["bbox"][2]]
+    width = int(max(max(right) + 48, 800))
+    title_lines = max(1, math.ceil(len(title) * 17 / max(width - 80, 200)))   # ~17 px per character
+    dates_top = 28 + 50 * title_lines + 8
+    top = min([b["top"] for b in boxes] + [parsed["bbox"][1]])
+    shift = max(0, int(math.ceil(dates_top + 26 + 10 - top)))
+    bottom = max([b["top"] + b["height"] for b in boxes] + [parsed["bbox"][3]]) + shift
+    return {"width": width, "height": int(max(bottom + 48, 420)), "shift": shift,
+            "dates_top": dates_top}
+
+
+def cleanup_empty_ink(page_dir):
+    """Remove ink/ folders left by older versions that hold only empty InkML."""
+    d = os.path.join(page_dir, "ink")
+    if not os.path.isdir(d):
+        return
+    files = os.listdir(d)
+    if not files or not all(f.endswith(".inkml") for f in files):
+        return
+    for f in files:
+        try:
+            with open(os.path.join(d, f), "rb") as fh:
+                if parse_inkml(fh.read()):
+                    return                    # real handwriting: never delete
+        except Exception:
+            return                            # unreadable: keep it
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def ink_page_outdated(e, html_path):
+    """True for a page exported with handwriting by an older version (its html page does
+    not draw the handwriting itself): it is downloaded again."""
+    d = os.path.join(e["dir"], "ink")
+    if not os.path.isdir(d) or not any(f.endswith(".svg") for f in os.listdir(d)):
+        return False
+    try:
+        with open(html_path, encoding="utf-8") as f:
+            return INK_MARKER not in f.read()
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -836,7 +1026,7 @@ def find_browser():
     return next((p for p in BROWSER_APPS if os.path.exists(p)), None)
 
 
-def render_page(html_path, out_dir, base_name):
+def render_page(html_path, out_dir, base_name, size=None):
     """Render the saved page (html/<seq>_<name>.html) to PDF and/or PNG inside out_dir.
     Returns the file names created. Nothing is raised: problems go to errors.csv."""
     exe = find_browser()
@@ -852,7 +1042,8 @@ def render_page(html_path, out_dir, base_name):
     if fmt in ("pdf", "both"):
         targets.append(("pdf", ["--print-to-pdf={out}", "--no-pdf-header-footer"]))
     if fmt in ("png", "both"):
-        targets.append(("png", ["--screenshot={out}", "--window-size=1100,3200",
+        window = f"{size[0] + 80},{size[1] + 160}" if size else "1100,3200"
+        targets.append(("png", ["--screenshot={out}", f"--window-size={window}",
                                 "--hide-scrollbars"]))
     url = Path(html_path).resolve().as_uri()
     sandbox = ["--no-sandbox"] if (hasattr(os, "geteuid") and os.geteuid() == 0) else []
@@ -1191,8 +1382,9 @@ body{margin:0;background:#f3f2f1;color:#201f1e;font-family:"Segoe UI","Segoe UI 
 .title{font-family:"Segoe UI Light","Segoe UI",-apple-system,"Helvetica Neue",Arial,sans-serif;font-weight:300;font-size:2.25rem;line-height:1.2;margin:0;padding-bottom:6px;border-bottom:1px solid #c8c6c4;display:inline-block;min-width:50%;max-width:100%;overflow-wrap:anywhere}
 .dates{color:#767676;font-size:.9rem;margin:10px 0 32px;display:flex;gap:24px;flex-wrap:wrap}
 .dates b{font-weight:600;margin-right:6px}
+.dates span{margin-right:24px}
 .content{font-size:1rem;line-height:1.55;overflow-wrap:anywhere}
-.content div[style*="absolute"]{position:static!important;left:auto!important;top:auto!important;width:auto!important;margin:0 0 16px!important}
+.page:not(.canvas) .content div[style*="absolute"]{position:static!important;left:auto!important;top:auto!important;width:auto!important;margin:0 0 16px!important}
 .content p{margin:0 0 .6em}
 .content img{max-width:100%;height:auto}
 .content table{border-collapse:collapse;margin:8px 0;max-width:100%}
@@ -1209,6 +1401,10 @@ body{margin:0;background:#f3f2f1;color:#201f1e;font-family:"Segoe UI","Segoe UI 
 .content p.attachment a::before{content:"\1F4CE\00a0"}
 .content details.ocr{margin:.3em 0 1em;color:#605e5c;font-size:.9rem}
 .content details.ocr pre{white-space:pre-wrap;margin:.4em 0}
+.page.canvas{position:relative;padding:0;max-width:none;overflow:hidden}
+.page.canvas .title{position:absolute;left:40px;top:28px;margin:0;max-width:calc(100% - 80px)}
+.page.canvas .dates{position:absolute;left:48px;top:84px;margin:0;flex-wrap:nowrap;white-space:nowrap}
+.ink-layer{position:absolute;left:0;top:0;pointer-events:none}
 .ink{margin-top:2em;border-top:1px solid #c8c6c4;padding-top:1em}
 .ink h2{font-weight:400;font-size:1.1rem;color:#605e5c}
 @media print{.topbar,.pager{display:none}body{background:#fff}.page{box-shadow:none;margin:0}}
@@ -1246,10 +1442,10 @@ PAGE_TEMPLATE = Template("""<!DOCTYPE html>
   <a href="index.html">&#9776; $section</a>
   <nav class="crumbs">$crumbs</nav>
 </header>
-<main class="page">
+<main class="page$page_class"$page_style>
   <h1 class="title">$title</h1>
-  <div class="dates"><span><b>Created</b>$created</span><span><b>Modified</b>$modified</span></div>
-  <div class="content">
+  <div class="dates"$dates_style><span><b>Created</b>$created</span>$modified_span</div>
+  <div class="content"$content_style>
 $body
   </div>
 $extra
@@ -1283,7 +1479,9 @@ def html_href(entry, prefix=""):
     return prefix + quote(entry["html_name"])
 
 
-def render_page_html(e, section_name, body, created, modified, prev_e, next_e, extra=""):
+def render_page_html(e, section_name, body, created, modified, prev_e, next_e, extra="",
+                     page_class="", page_style="", extra_css="", dates_style="",
+                     content_style=""):
     links, anc = [], e["parent"]
     while anc:
         links.append(f'<a href="{html_href(anc)}">{html.escape(anc["title"])}</a>')
@@ -1298,9 +1496,13 @@ def render_page_html(e, section_name, body, created, modified, prev_e, next_e, e
                 else f'<a href="{html_href(other)}">{label} &rarr;</a>')
 
     return PAGE_TEMPLATE.substitute(
-        title_text=html.escape(e["title"]), css=PAGE_CSS, section=html.escape(section_name),
+        title_text=html.escape(e["title"]), css=PAGE_CSS + extra_css,
+        page_class=page_class, page_style=page_style, section=html.escape(section_name),
         crumbs=crumbs, title=html.escape(e["title"]),
-        created=html.escape(created), modified=html.escape(modified), body=body, extra=extra,
+        created=html.escape(created), body=body, extra=extra,
+        dates_style=dates_style, content_style=content_style,
+        modified_span=("" if modified == created      # same moment: show it once
+                       else f'<span><b>Modified</b>{html.escape(modified)}</span>'),
         prev=pager(prev_e, True), next=pager(next_e, False))
 
 
@@ -1459,6 +1661,21 @@ def prepare_html_body(content, prefix):
     return body_of(content)
 
 
+def export_summary(stats, strokes, rendered):
+    """'2 images, 1 table, 2 attachments, 94 handwriting strokes, 1 PDF' (only what exists)."""
+    def count(n, word):
+        return f"{n} {word}" + ("" if n == 1 else "s")
+
+    parts = []
+    for key, word in (("images", "image"), ("tables", "table"), ("attachments", "attachment")):
+        if stats.get(key):
+            parts.append(count(stats[key], word))
+    if strokes:
+        parts.append(count(strokes, "handwriting stroke"))
+    parts += [f"1 {name.rsplit('.', 1)[-1].upper()} copy" for name in rendered]
+    return parts
+
+
 def build_page(e, tmp_dir):
     """Download one page into tmp_dir (nothing outside tmp_dir is touched)."""
     page, title = e["page"], e["title"]
@@ -1475,12 +1692,13 @@ def build_page(e, tmp_dir):
 
     mc = MarkdownConverter()
     mc.feed(content)
-    ink_svgs = save_ink(inks, tmp_dir) if inks else []
-    md = f"# {title}\n\nCreated: {created}  \nModified: {modified}\n\n---\n\n{mc.result()}"
-    if ink_svgs:
+    ink = save_ink(inks, tmp_dir) if inks else None
+    dates = f"Created: {created}" + ("" if modified == created else f"  \nModified: {modified}")
+    md = f"# {title}\n\n{dates}\n\n---\n\n{mc.result()}"
+    if ink:
         md += "\n## Handwriting\n\n" + "\n\n".join(
             f"![Handwriting]({quote(p)})\n\n[Open {os.path.basename(p)} in a browser]({quote(p)})"
-            for p in ink_svgs) + "\n"
+            for p in ink["svgs"]) + "\n"
     write_text(os.path.join(tmp_dir, e["md_name"]), md)
 
     for i, rows in enumerate(mc.tables, 1):
@@ -1488,9 +1706,9 @@ def build_page(e, tmp_dir):
 
     stats = {"words": words, "size": page_size(tmp_dir), "images": len(images),
              "tables": len(mc.tables), "attachments": len(attachments)}
-    return {"content": content, "ink": ink_svgs, "created": created, "modified": modified,
-            "stats": stats,
-            "needs_render": bool(inks) or "data-ocr-text=" in content or (words == 0 and bool(images))}
+    return {"content": content, "ink": ink, "created": created, "modified": modified,
+            "stats": stats, "strokes": len(ink["parsed"]["strokes"]) if ink else 0,
+            "needs_render": bool(ink) or "data-ocr-text=" in content or (words == 0 and bool(images))}
 
 
 def commit_page_dir(tmp, final):
@@ -1508,24 +1726,32 @@ def commit_page_dir(tmp, final):
 
 
 def write_page_html(e, html_dir, section_name, prev_e, next_e, built):
+    """Write html/<seq>_<name>.html (written last: its existence marks the page as complete).
+    Returns (width, height) when the page was laid out on a canvas, else None."""
     prefix = "../pages/" + "/".join(quote(p) for p in e["rel_parts"]) + "/"
     body = prepare_html_body(built["content"], prefix)
-    extra = ""
-    if built["ink"]:
-        items = []
-        for i, p in enumerate(built["ink"], 1):
-            href = f"{prefix}{quote(p)}"
-            label = f" {i}" if len(built["ink"]) > 1 else ""
-            items.append(
-                f'<p><a href="{href}" target="_blank" rel="noopener">'
-                f'Open handwriting{label} in a browser (SVG)</a></p>'
-                f'<a href="{href}" target="_blank" rel="noopener">'
-                f'<img src="{href}" alt="Handwriting{label}"></a>')
-        extra = f'<div class="ink"><h2>Handwriting</h2>{"".join(items)}</div>'
-    # written last: its existence marks the page as completely exported
+    ink, canvas = built.get("ink"), None
+    extra = page_class = page_style = extra_css = dates_style = content_style = ""
+    if ink:
+        if OPTS["ink_layout"] == "canvas":
+            # OneNote page coordinates: text boxes keep their position and the handwriting is
+            # drawn over them, so the page looks like it does in OneNote
+            layout = canvas_layout(built["content"], ink["parsed"], e["title"])
+            width, height, shift = layout["width"], layout["height"], layout["shift"]
+            canvas = (width, height)
+            page_class, page_style = " canvas", f' style="width:{width}px;min-height:{height}px"'
+            dates_style = f' style="top:{layout["dates_top"]}px"'
+            content_style = f' style="position:absolute;left:0;top:{shift}px;width:{width}px"'
+            extra_css = f"@page{{size:{width}px {height}px;margin:0}}"
+            extra = overlay_svg(ink["parsed"], width, height, shift)
+        else:
+            drawings = "".join(standalone_svg(p, inline=True) for p in ink["parts"])
+            extra = f'<div class="ink"><h2>Handwriting</h2>{drawings}</div>'
     write_text(os.path.join(html_dir, e["html_name"]),
                render_page_html(e, section_name, body, built["created"], built["modified"],
-                                prev_e, next_e, extra))
+                                prev_e, next_e, extra, page_class, page_style, extra_css,
+                                dates_style, content_style))
+    return canvas
 
 
 def stats_from_disk(e):
@@ -1660,8 +1886,11 @@ def export_section(sid, outdir=".", folder_name=None, notebook_link=None, only_p
             label = f"  [{n}/{len(entries)}] {e['seq']}  {'  ' * e['level']}{e['title']}"
 
             rec = state["done"].get(pid)
+            if on_disk(e):
+                cleanup_empty_ink(e["dir"])
             if (on_disk(e) and pid not in retry
-                    and (rec is None or rec.get("folder") == rel_folder)):
+                    and (rec is None or rec.get("folder") == rel_folder)
+                    and not ink_page_outdated(e, os.path.join(html_dir, e["html_name"]))):
                 if os.path.isdir(tmp_dir):
                     shutil.rmtree(tmp_dir)
                 e["stats"] = (rec or {}).get("stats") or stats_from_disk(e)
@@ -1679,12 +1908,17 @@ def export_section(sid, outdir=".", folder_name=None, notebook_link=None, only_p
                     shutil.rmtree(tmp_dir)
                 built = build_page(e, tmp_dir)
                 commit_page_dir(tmp_dir, e["dir"])
-                write_page_html(e, html_dir, sec_name, prev_e, next_e, built)
+                canvas = write_page_html(e, html_dir, sec_name, prev_e, next_e, built)
+                rendered = []
                 if OPTS["render"] == "all" or (OPTS["render"] == "auto" and built["needs_render"]):
-                    if render_page(os.path.join(html_dir, e["html_name"]), e["dir"],
-                                   e["md_name"][:-3]):
+                    rendered = render_page(os.path.join(html_dir, e["html_name"]), e["dir"],
+                                           e["md_name"][:-3], canvas)
+                    if rendered:
                         built["stats"]["size"] = page_size(e["dir"])
                 e["stats"], e["status"] = built["stats"], "ok"
+                summary = export_summary(built["stats"], built["strokes"], rendered)
+                if summary:
+                    print("    Exported " + ", ".join(summary))
                 if any(r[1] in RETRY_CATEGORIES for r in ERRORS.rows[before:]):
                     e["incomplete"] = True          # saved, but something is missing: retried next run
                     incomplete += 1
@@ -2002,6 +2236,9 @@ def main(argv=None):
     ap.add_argument("--utc", action="store_true", help="show dates in UTC instead of local time")
     ap.add_argument("--no-ink", action="store_true", help="do not request handwriting (InkML)")
     ap.add_argument("--ocr", action="store_true", help="OCR downloaded images with tesseract")
+    ap.add_argument("--ink-layout", choices=["canvas", "end"], default="canvas",
+                    help="html pages with handwriting: canvas = draw it over the text boxes at "
+                         "OneNote's positions (default), end = show it below the page text")
     ap.add_argument("--render", choices=["auto", "all", "none"], default="auto",
                     help="save pages as PDF/PNG: auto = pages with handwriting, OCR text or "
                          "only images (default), all, none")
@@ -2015,7 +2252,7 @@ def main(argv=None):
         return 1
     set_token(raw)
     OPTS.update(utc=args.utc, ink=not args.no_ink, ocr=args.ocr, render=args.render,
-                render_as=args.render_as)
+                render_as=args.render_as, ink_layout=args.ink_layout)
 
     real_stdout = sys.stdout
     sys.stdout = Tee(real_stdout)

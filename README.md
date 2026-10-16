@@ -19,8 +19,8 @@ anything that could not be downloaded or understood is written to `errors.csv` f
 
 > **Status.** The script was developed against documented Graph behaviour and tested with
 > mocked API responses (rate limits, failed downloads, expired tokens, nested sections and
-> pages, ink, OCR, rendering). Features marked *unverified* below could not be confirmed against
-> a live account. Always keep your original notebooks and review a sample of the export.
+> pages, ink, OCR, rendering). Anything described below as approximate or assumed (for example the
+> placement of handwriting) could not be confirmed against every kind of live page. Always keep your original notebooks and review a sample of the export.
 
 ## Contents
 
@@ -50,6 +50,7 @@ anything that could not be downloaded or understood is written to `errors.csv` f
   file names, tables of contents and CSV files.
 - Three views of the same content: **Markdown** (per page), **HTML** (OneNote-style pages with an
   index, breadcrumbs and previous/next links) and **CSV/JSON metadata**.
+  Each page shows its Created date, and its Modified date only when that differs from Created.
 - Downloads **images** (full resolution first, detected file type), **attachments**, inline
   data-URI images, and puts OneNote's split images back in order.
 - Every table is also saved as a **CSV** file.
@@ -142,7 +143,7 @@ NAME
     export_onenote.py - export OneNote notebooks, sections or pages through Microsoft Graph
 
 SYNOPSIS
-    python3 export_onenote.py N|S|P ID [-o DIR] [--utc] [--no-ink] [--ocr]
+    python3 export_onenote.py N|S|P ID [-o DIR] [--utc] [--no-ink] [--ink-layout canvas|end] [--ocr]
                                        [--render auto|all|none] [--render-as pdf|png|both]
     python3 export_onenote.py -h
 
@@ -154,6 +155,10 @@ DESCRIPTION
         N   a notebook   (all sections and section groups inside it)
         S   a section    (all pages, with sub-pages nested)
         P   a page       (only that page, numbered 1)
+
+    The console shows one line per page; when a page brings extra files, a second line
+    says what was exported, for example "Exported 2 images, 1 table, 2 attachments,
+    94 handwriting strokes" (nothing is printed for pages without extra files).
 
     The command is safe to stop and run again: see RESUMING.
 
@@ -167,6 +172,15 @@ OPTIONS
     --no-ink
             Do not ask Graph for handwriting (InkML). Saves one probe per run when you
             know your pages have no handwriting.
+    --ink-layout canvas|end
+            How the HTML pages show handwriting.
+              canvas  (default) the page keeps OneNote's layout: text boxes stay where
+                      OneNote put them and the handwriting is drawn over them as an inline
+                      SVG, so the page looks like it does in OneNote.
+              end     the page text is shown in reading order and the handwriting is
+                      shown below it.
+            The standalone SVG (ink/ink.svg, openable in any browser) is saved either way and
+            is linked from the page's Markdown file.
     --ocr
             Run the local `tesseract` program on every downloaded image. The text is saved
             next to the image (image-01.txt), as a quote in the Markdown and in a
@@ -260,7 +274,7 @@ A section folder:
                 ├── images/image-01.txt            (only with --ocr)
                 ├── tables/table-01.csv            (only if the page has tables)
                 ├── attachments/report.pdf         (only if the page has attachments)
-                └── ink/ink.inkml, ink/ink.svg     (only if Graph returned handwriting)
+                └── ink/ink.inkml, ink/ink.svg     (only if the page really has handwriting)
 ```
 
 Folder and file names replace the characters `\ / : * ? " < > |` with `_` and are limited to
@@ -312,7 +326,7 @@ Columns: Time, Category, Section, Section ID, Page, Page ID, Sequence, Item, URL
 | `download` | An image or attachment could not be downloaded | Yes (the page is downloaded again) |
 | `page` | A page's content could not be fetched or processed | Yes |
 | `section` | A section / notebook could not be read | Yes |
-| `format` | A data format the script cannot fully handle: embedded video (`iframe`), `embed`, `audio`, `video`, `canvas`, inline `svg`, objects without a file name, unrecognised image data, handwriting position, unsupported API options, missing browser | No; kept for your review |
+| `format` | A data format the script cannot fully handle: embedded video (`iframe`), `embed`, `audio`, `video`, `canvas`, inline `svg`, objects without a file name, unrecognised image data, unreadable InkML, unsupported API options, missing browser | No; kept for your review |
 | `ocr` | OCR could not run (for example `tesseract` is not installed) | No |
 
 The file is rewritten on every run: rows for pages that were downloaded again are replaced, rows
@@ -345,7 +359,7 @@ normally never need to open it.
 | Inline (data-URI) images | Yes | Yes | |
 | File attachments | Yes (link) | Yes (link) | Includes vCards from OneNote data extraction |
 | Videos / embedded web content | Link only | Embedded frame | Logged for review |
-| Handwriting (ink) | Approximate SVG, with an "open in a browser" link | Approximate SVG, clickable, with an "open in a browser" link | *Unverified*: relies on Graph accepting `includeInkML`; shown at the end of the page, not at its original position. SVG files open directly in any browser |
+| Handwriting (ink) | SVG image with an "open in a browser" link | Inline SVG drawn over the text boxes at OneNote's positions (or below the text with `--ink-layout end`) | Graph returns it for `includeInkML` requests (pages without handwriting get an empty part, which is ignored without any log entry). Placement assumes OneNote's ink units (himetric, 0.01 mm) share the page origin with the text boxes; check a sample page |
 | OCR text of images | With `--ocr` | With `--ocr` | Local `tesseract`; weak on real handwriting |
 | Font colours, highlighting, fonts | No | Yes (inline styles kept) | |
 | Page layout (text boxes at fixed positions) | n/a | Stacked in reading order | OneNote's absolute positions are not reproduced |
@@ -383,6 +397,11 @@ The token is only ever sent to `graph.microsoft.com`, `www.onenote.com` and `one
 
 If `progress.json` is missing (for example after a power cut), the same disk check is used, so
 re-running is always safe and cheap.
+
+Exports made by older versions are upgraded in place: pages that have handwriting but whose
+HTML does not draw it are downloaded again, `ink/` folders that hold only empty InkML are
+removed, and earlier "no drawable strokes" / "handwriting saved" rows in `errors.csv` are
+dropped.
 
 A finished section whose `pages.csv` is out of date (for example an export made before the
 `Page ID` column existed) is not skipped: its `pages.csv` and indexes are rewritten with the
@@ -442,7 +461,7 @@ Nothing outside Python's standard library is used except `requests`.
 | Network | `get`, `backoff`, `paged`, `fetch_resource` | One place for the retry policy, auth, paging and alternate resource URLs |
 | Files | `atomic_write`, `write_csv`, `write_json`, `save_stream` | `.part` + rename writes; CSVs with a UTF-8 BOM so Excel reads them correctly |
 | Resources | `localize_resources`, `reorder_split_images`, `image_ext` | Download images/attachments, data URIs, split-image order, re-point links, flag unsupported tags |
-| Ink / OCR / render | `split_multipart`, `inkml_to_svg`, `ocr_image`, `render_page` | Optional extras, each failing softly into `errors.csv` |
+| Ink / OCR / render | `split_multipart`, `parse_inkml`, `save_ink`, `canvas_size`, `ocr_image`, `render_page` | Optional extras, each failing softly into `errors.csv` |
 | Conversion | `TextExtractor`, `MarkdownConverter` | HTML to word count / Markdown; collects tables for CSV export |
 | HTML output | `PAGE_TEMPLATE`, `prepare_html_body`, `render_page_html`, `render_index` | OneNote-style pages, breadcrumbs, previous/next, section index |
 | Section export | `build_entries`, `export_section`, `build_page`, `commit_page_dir`, `stats_from_disk` | Numbering, resume logic, atomic page replacement |
@@ -451,7 +470,7 @@ Nothing outside Python's standard library is used except `requests`.
 ### Key design decisions
 
 - **Graph, not COM.** It removes the Windows/OneNote dependency, but Graph returns less than the
-  desktop app: no section order, no OCR text, and ink only through an option the script probes.
+  desktop app: no section order, no OCR text, and ink only through the `includeInkML` option.
 - **Page levels need `pagelevel=true`.** Graph omits `level` and `order` unless asked; the script
   tries three request forms until levels appear.
 - **The HTML file is the completion marker.** It is written last, atomically, so "HTML exists"
@@ -468,8 +487,10 @@ Nothing outside Python's standard library is used except `requests`.
 - Built for **personal Microsoft accounts**; work or school accounts were not tested.
 - Graph provides no section order, so sections follow the API's order and may differ from your
   tab order in OneNote. Sections are listed before section groups.
-- **Handwriting** may be unavailable: the script requests `includeInkML`, but this could not be
-  confirmed for Graph v1.0; if the API refuses it, that is logged once and ink is skipped.
+- **Handwriting** is drawn from the InkML Graph returns. Strokes are approximate (pen pressure
+  and exact brush shapes are not reproduced) and their placement relies on the assumption that
+  ink coordinates (himetric) and text-box positions (pixels) share one origin; if a page looks
+  misaligned, use `--ink-layout end` and report it. Pages without handwriting need no handling.
 - OCR uses `tesseract` on your machine, not Microsoft's OCR, and is unreliable for handwriting.
 - Page layout is flattened to reading order in HTML; Markdown loses colours and fonts.
 - Embedded videos and web content are kept as links; unsupported elements are logged, not
