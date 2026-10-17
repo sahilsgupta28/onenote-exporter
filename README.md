@@ -334,7 +334,7 @@ Columns: Time, Category, Section, Section ID, Page, Page ID, Sequence, Item, URL
 | `download` | An image or attachment could not be downloaded | Yes (the page is downloaded again) |
 | `page` | A page's content could not be fetched or processed | Yes |
 | `section` | A section / notebook could not be read | Yes |
-| `format` | A data format the script cannot fully handle: embedded video (`iframe`), `embed`, `audio`, `video`, `canvas`, inline `svg`, objects without a file name, unrecognised image data, unreadable InkML, unsupported API options, missing browser | No; kept for your review |
+| `format` | A data format the script cannot fully handle: `iframe` / `embed` / `video` / `audio` elements **without a URL**, `canvas`, inline `svg`, objects without a file name, unrecognised image data, unreadable InkML, unsupported API options, missing browser | No; kept for your review |
 | `ocr` | OCR could not run (for example `tesseract` is not installed) | No |
 
 The file is rewritten on every run: rows for pages that were downloaded again are replaced, rows
@@ -366,7 +366,7 @@ normally never need to open it.
 | Images | Yes (linked file) | Yes (embedded in the page by default) | Full resolution first; type detected from the file bytes (default `.png`); split images reordered |
 | Inline (data-URI) images | Yes | Yes | |
 | File attachments | Yes (link) | Yes (link) | Includes vCards from OneNote data extraction |
-| Videos / embedded web content | Link only | Embedded frame | Logged for review |
+| Videos / embedded web content (with a URL) | Link only | Embedded frame / player | Not logged: the URL is kept; only elements without a URL are reported |
 | Handwriting (ink) | SVG image with an "open in a browser" link | Inline SVG drawn over the text boxes at OneNote's positions (or below the text with `--ink-layout end`) | Graph returns it for `includeInkML` requests (pages without handwriting get an empty part, which is ignored without any log entry). Placement assumes OneNote's ink units (himetric, 0.01 mm) share the page origin with the text boxes; check a sample page |
 | OCR text of images | With `--ocr` | With `--ocr` | Local `tesseract`; weak on real handwriting |
 | Font colours, highlighting, fonts | No | Yes (inline styles kept) | |
@@ -503,8 +503,8 @@ Nothing outside Python's standard library is used except `requests`.
 - OCR uses `tesseract` on your machine, not Microsoft's OCR, and is unreliable for handwriting.
 - With `--html-images embed` the HTML files are larger, because they contain their pictures.
 - Page layout is flattened to reading order in HTML; Markdown loses colours and fonts.
-- Embedded videos and web content are kept as links; unsupported elements are logged, not
-  converted.
+- Embedded videos and web content are kept as links (nothing is downloaded); elements without a
+  URL and other unsupported elements are logged, not converted.
 - `Sequence` values such as `1.10` may be shown as `1.1` if you open `pages.csv` in Excel; import
   the column as text.
 - Graph tokens expire after about an hour; long exports may need a fresh token mid-way (resume

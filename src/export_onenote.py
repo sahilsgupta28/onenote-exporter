@@ -4,7 +4,7 @@
 Export OneNote content (personal account) via Microsoft Graph.
 
 Usage:
-  pip3 instal requests
+  pip3 install requests
   export ONENOTE_TOKEN='<access token from Graph Explorer>'      # use SINGLE quotes
   python3 export_onenote.py N '<notebook id>'      # a whole notebook
   python3 export_onenote.py S '<section id>'       # one section
@@ -192,9 +192,12 @@ class ErrorLog:
     @staticmethod
     def obsolete(row):
         """Notes written by older versions for every page, which were not real problems."""
-        return (row[1] == "format" and row[7] == "ink"
-                and (row[9].startswith("InkML has no drawable strokes")
-                     or "handwriting part(s) saved as InkML" in row[9]))
+        if row[1] != "format":
+            return False
+        if row[7] == "ink":
+            return (row[9].startswith("InkML has no drawable strokes")
+                    or "handwriting part(s) saved as InkML" in row[9])
+        return row[7] in ("iframe", "embed", "video", "audio") and bool(row[8])   # had a URL
 
     @staticmethod
     def key(row):
@@ -491,6 +494,7 @@ DATA_URI_RE = re.compile(r"^data:([\w/+.-]*)(;base64)?,(.*)$", re.I | re.S)
 
 # Elements the script cannot turn into files / markdown. They are logged to errors.csv
 # (category "format") so you can review the affected pages.
+URL_TAGS = ("iframe", "embed", "video", "audio")     # fine when they carry a URL
 UNHANDLED_TAGS = {
     "iframe": "embedded video / web content cannot be downloaded (link kept in markdown and html)",
     "embed": "embedded plug-in content is not supported",
@@ -670,11 +674,26 @@ def localize_resources(content, page_dir):
     content = re.sub(r"<object\b[^>]*>", repl_obj, content, flags=re.I | re.S)
 
     for tagname, why in UNHANDLED_TAGS.items():
-        found = re.findall(rf"<{tagname}\b[^>]*>", content, flags=re.I | re.S)
-        if found:
-            src = attr(found[0], "data-original-src") or attr(found[0], "src") or ""
-            ERRORS.add("format", tagname, f"{len(found)} <{tagname}> element(s): {why}",
-                       html.unescape(src)[:300])
+        matches = list(re.finditer(rf"<{tagname}\b[^>]*>", content, flags=re.I | re.S))
+        if tagname in URL_TAGS:
+            # Embedded videos / web content that carry a URL are fine: the URL stays in the
+            # html page and becomes a link in the Markdown. Only elements without any URL
+            # (nothing can be kept) are reported.
+            def has_url(m):
+                tag = m.group(0)
+                if attr(tag, "data-original-src") or attr(tag, "src") or attr(tag, "data"):
+                    return True
+                if tagname in ("video", "audio") and not tag.rstrip().endswith("/>"):
+                    close = content.lower().find(f"</{tagname}", m.end())
+                    inner = content[m.end(): close if close != -1 else m.end() + 2000]
+                    return bool(re.search(r"<source\b[^>]*\bsrc\s*=", inner, flags=re.I))
+                return False
+
+            matches = [m for m in matches if not has_url(m)]
+            why = "without a URL, so nothing could be kept"
+        if matches:
+            ERRORS.add("format", tagname, f"{len(matches)} <{tagname}> element(s) {why}"
+                       if tagname in URL_TAGS else f"{len(matches)} <{tagname}> element(s): {why}")
     return content, images, attachments
 
 
@@ -1149,6 +1168,7 @@ class MarkdownConverter(HTMLParser):
         self.table_stack = []
         self.fmt = []           # open bold/italic/strike markers
         self.links = []
+        self.media_urls = set()   # one link per embedded video URL
 
     # -- helpers
     def w(self, s):
@@ -1257,9 +1277,10 @@ class MarkdownConverter(HTMLParser):
             if name:
                 ref = f"[Attachment: {name}]({data})" if data else f"Attachment: {name}"
                 self.w(ref if (self.in_cell() or self.lists) else f"\n\n{ref}\n\n")
-        elif tag == "iframe":
+        elif tag in ("iframe", "video", "audio", "embed", "source"):
             url = a.get("data-original-src") or a.get("src") or ""
-            if url:
+            if url and url not in self.media_urls:
+                self.media_urls.add(url)
                 ref = f"[Video / embedded content: {url}]({url})"
                 self.w(ref if (self.in_cell() or self.lists) else f"\n\n{ref}\n\n")
         elif tag in ("ul", "ol"):
@@ -1680,7 +1701,7 @@ def prepare_html_body(content, prefix, page_dir=None, embed=False):
     """Page HTML as shown in html/<seq>_<name>.html (the part inside <body>)."""
     # <object/> and <iframe/> are not void elements in HTML5: written self-closed they would
     # swallow the rest of the page, so expand them.
-    content = re.sub(r"<(object|iframe)\b([^>]*?)\s*/>", r"<\1\2></\1>", content,
+    content = re.sub(r"<(object|iframe|video|audio)\b([^>]*?)\s*/>", r"<\1\2></\1>", content,
                      flags=re.I | re.S)
     if embed and page_dir:
         content = embed_images(content, page_dir)
