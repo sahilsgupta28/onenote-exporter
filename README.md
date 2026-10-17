@@ -54,8 +54,8 @@ anything that could not be downloaded or understood is written to `errors.csv` f
 - Downloads **images** (full resolution first, detected file type), **attachments**, inline
   data-URI images, and puts OneNote's split images back in order.
 - Every table is also saved as a **CSV** file.
-- Optional **handwriting** (InkML to SVG), **OCR** of images (local `tesseract`), and **PDF/PNG
-  copies** of handwriting / image-only pages (local Chromium-based browser).
+- Handwriting (InkML to SVG) shown in the pages; optional **OCR** of images (local `tesseract`);
+  optional **PDF/PNG copies** of pages (`--render`, off by default; local Chromium-based browser).
 - **Rate-limit aware**: up to 10 retries on HTTP 429 with exponential back-off (2, 4, 8, 16, then
   20 seconds), then a clean stop with a "run again later" message.
 - **Resumable**: progress is tracked in memory, written to `metadata/progress.json` when something
@@ -90,7 +90,7 @@ produce one.
 - A Microsoft Graph **access token** with the `Notes.Read` permission (see below)
 - Optional:
   - [`tesseract`](https://github.com/tesseract-ocr/tesseract) on your `PATH` for `--ocr`
-  - Google Chrome, Chromium, Microsoft Edge or Brave for PDF/PNG copies of pages
+  - Google Chrome, Chromium, Microsoft Edge or Brave, only if you use `--render` to save pages as PDF/PNG
 
 The script runs wherever Python runs. It uses no other third-party Python packages.
 
@@ -143,7 +143,7 @@ NAME
     export_onenote.py - export OneNote notebooks, sections or pages through Microsoft Graph
 
 SYNOPSIS
-    python3 export_onenote.py N|S|P ID [-o DIR] [--utc] [--no-ink] [--ink-layout canvas|end] [--ocr]
+    python3 export_onenote.py N|S|P ID [-o DIR] [--utc] [--no-ink] [--ink-layout canvas|end] [--html-images embed|link] [--ocr]
                                        [--render auto|all|none] [--render-as pdf|png|both]
     python3 export_onenote.py -h
 
@@ -172,6 +172,14 @@ OPTIONS
     --no-ink
             Do not ask Graph for handwriting (InkML). Saves one probe per run when you
             know your pages have no handwriting.
+    --html-images embed|link
+            How the HTML pages show images.
+              embed  (default) the images are placed inside each page file, so they show
+                     wherever the page is opened. Browsers such as Safari often refuse to
+                     load pictures from outside the folder of a local HTML file.
+              link   the page refers to the files in pages/ (smaller HTML files, but the
+                     images may not show in every browser). Pictures over 20 MB stay linked.
+            The image files are saved in pages/.../images/ either way.
     --ink-layout canvas|end
             How the HTML pages show handwriting.
               canvas  (default) the page keeps OneNote's layout: text boxes stay where
@@ -187,9 +195,9 @@ OPTIONS
             collapsible block in the HTML. Graph itself does not return OCR text.
     --render auto|all|none
             Save the finished page as PDF/PNG with a headless Chromium-based browser.
-              auto  (default) pages with handwriting, OCR text, or images but no text
+              none  (default) no PDF/PNG export
+              auto  pages with handwriting, OCR text, or images but no text
               all   every page
-              none  never
     --render-as pdf|png|both
             Format of the saved page. Default: pdf. PNG is one screenshot of a fixed-size
             window, so very long pages can be cut off; use pdf for those.
@@ -269,7 +277,7 @@ A section folder:
         └── pages/                   sub-pages, same structure
             └── 3.1_Exercises/
                 ├── 3.1_Exercises.md
-                ├── 3.1_Exercises.pdf      (handwriting / OCR / image-only pages)
+                ├── 3.1_Exercises.pdf      (only with --render)
                 ├── images/image-01.png            (only if the page has images)
                 ├── images/image-01.txt            (only with --ocr)
                 ├── tables/table-01.csv            (only if the page has tables)
@@ -355,7 +363,7 @@ normally never need to open it.
 | To-do checkboxes | Yes (`[ ]` / `[x]`) | Yes | |
 | Other note tags (Important, Question ...) | Yes, as a bold label | Attribute kept | |
 | Tables | Yes, plus a CSV per table | Yes | First row becomes the Markdown header; nested tables are flattened into their cell |
-| Images | Yes | Yes | Full resolution first; type detected from the file bytes (default `.png`); split images reordered |
+| Images | Yes (linked file) | Yes (embedded in the page by default) | Full resolution first; type detected from the file bytes (default `.png`); split images reordered |
 | Inline (data-URI) images | Yes | Yes | |
 | File attachments | Yes (link) | Yes (link) | Includes vCards from OneNote data extraction |
 | Videos / embedded web content | Link only | Embedded frame | Logged for review |
@@ -363,7 +371,7 @@ normally never need to open it.
 | OCR text of images | With `--ocr` | With `--ocr` | Local `tesseract`; weak on real handwriting |
 | Font colours, highlighting, fonts | No | Yes (inline styles kept) | |
 | Page layout (text boxes at fixed positions) | n/a | Stacked in reading order | OneNote's absolute positions are not reproduced |
-| Whole page as picture | PDF/PNG file | | Needs a Chromium-based browser |
+| Whole page as picture | PDF/PNG file | | Off by default; `--render` turns it on; needs a Chromium-based browser |
 
 OneNote's own data-extraction output (business cards, recipes, products) arrives from Graph as
 ordinary HTML plus a vCard attachment, so it needs no special handling.
@@ -398,7 +406,8 @@ The token is only ever sent to `graph.microsoft.com`, `www.onenote.com` and `one
 If `progress.json` is missing (for example after a power cut), the same disk check is used, so
 re-running is always safe and cheap.
 
-Exports made by older versions are upgraded in place: pages that have handwriting but whose
+Exports made by older versions are upgraded in place: pages that have images but whose HTML
+does not carry them are downloaded again, pages that have handwriting but whose
 HTML does not draw it are downloaded again, `ink/` folders that hold only empty InkML are
 removed, and earlier "no drawable strokes" / "handwriting saved" rows in `errors.csv` are
 dropped.
@@ -492,6 +501,7 @@ Nothing outside Python's standard library is used except `requests`.
   ink coordinates (himetric) and text-box positions (pixels) share one origin; if a page looks
   misaligned, use `--ink-layout end` and report it. Pages without handwriting need no handling.
 - OCR uses `tesseract` on your machine, not Microsoft's OCR, and is unreliable for handwriting.
+- With `--html-images embed` the HTML files are larger, because they contain their pictures.
 - Page layout is flattened to reading order in HTML; Markdown loses colours and fonts.
 - Embedded videos and web content are kept as links; unsupported elements are logged, not
   converted.
@@ -512,6 +522,7 @@ Nothing outside Python's standard library is used except `requests`.
 | "HTTP 429 persisted after 10 retries" | Microsoft is throttling you. Wait a while and run the same command again. |
 | Pages not nested / no sub-page folders | Graph returned no `level` values; the script prints a warning. Re-run, and check the section in Graph Explorer with `?$select=title,level,order&pagelevel=true`. |
 | Images missing in a page | See `errors.csv` (`download` rows). Re-run; those pages are retried automatically. |
+| Pictures show a broken-image icon in the HTML pages | Fixed by the default `--html-images embed` (re-run to upgrade older pages). With `--html-images link`, some browsers block images outside the HTML file's folder. If a picture is also missing from the Markdown file, it failed to download: check `errors.csv`. |
 | `no Chrome / Chromium ... found` in `errors.csv` | Install a Chromium-based browser or set `ONENOTE_BROWSER`. Only affects the PDF/PNG copies. |
 | `tesseract is not installed` | `brew install tesseract` (macOS) or your package manager, then re-run with `--ocr` on the pages you want. |
 | Want to redo a finished section | Delete its folder (and `progress.json`) and run again, or export it with `S` into a new folder. |

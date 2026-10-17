@@ -4,7 +4,7 @@
 Export OneNote content (personal account) via Microsoft Graph.
 
 Usage:
-  pip3 install requests
+  pip3 instal requests
   export ONENOTE_TOKEN='<access token from Graph Explorer>'      # use SINGLE quotes
   python3 export_onenote.py N '<notebook id>'      # a whole notebook
   python3 export_onenote.py S '<section id>'       # one section
@@ -14,11 +14,13 @@ Options:
   -o DIR      parent folder for the export (default: current folder)
   --utc       show dates in UTC instead of local time
   --no-ink    do not ask Graph for handwriting (InkML)
+  --html-images embed|link   html pages carry their images inside the file (default, always
+              shows) or link to the files in pages/ (smaller html; some browsers block them)
   --ink-layout canvas|end   html pages with handwriting: canvas (default) draws it over
               the text boxes at OneNote's positions, end shows it below the text
   --ocr       run local OCR (needs the `tesseract` program) on downloaded images
-  --render M  save pages as PDF/PNG: auto = pages with handwriting, OCR text or only
-              images (default), all, or none (needs Chrome/Chromium/Edge/Brave;
+  --render M  save pages as PDF/PNG: none (default: no PDF/PNG export), auto = pages with
+              handwriting, OCR text or only images, or all (needs Chrome/Chromium/Edge/Brave;
               or set ONENOTE_BROWSER=/path/to/browser)
   --render-as pdf|png|both   format of the saved page (default pdf)
 
@@ -34,7 +36,7 @@ section / page folder):
       sections/<seq>_<Section>/ (section groups are folders holding their sections)
           metadata/ (pages.csv, <Section name>.json)   html/ (index.html + one file per page)
           pages/<seq>_<Page>/
-              <seq>_<Page>.md      (+ <seq>_<Page>.pdf / .png for handwriting / OCR pages)
+              <seq>_<Page>.md      (+ <seq>_<Page>.pdf / .png only with --render)
               images/  tables/  attachments/  ink/      (only when there is something)
               pages/    sub-pages, same structure
 
@@ -72,7 +74,7 @@ from email import message_from_bytes
 from html.parser import HTMLParser
 from pathlib import Path
 from string import Template
-from urllib.parse import quote, unquote_to_bytes, urlparse
+from urllib.parse import quote, unquote, unquote_to_bytes, urlparse
 
 warnings.filterwarnings("ignore", message=".*OpenSSL.*")
 import requests  # noqa: E402
@@ -113,8 +115,8 @@ class TokenExpired(StopRun):
     pass
 
 
-OPTS = {"utc": False, "ink": True, "ocr": False, "render": "auto", "render_as": "pdf",
-        "ink_layout": "canvas"}
+OPTS = {"utc": False, "ink": True, "ocr": False, "render": "none", "render_as": "pdf",
+        "ink_layout": "canvas", "html_images": "embed"}
 RUN = {"kind": "", "id": ""}
 CTX = {"section": None, "page": None}      # (name, id) / page entry, used when logging errors
 INK_STATE = {"unsupported": False}
@@ -1384,7 +1386,8 @@ body{margin:0;background:#f3f2f1;color:#201f1e;font-family:"Segoe UI","Segoe UI 
 .dates b{font-weight:600;margin-right:6px}
 .dates span{margin-right:24px}
 .content{font-size:1rem;line-height:1.55;overflow-wrap:anywhere}
-.page:not(.canvas) .content div[style*="absolute"]{position:static!important;left:auto!important;top:auto!important;width:auto!important;margin:0 0 16px!important}
+.page:not(.canvas) .content [style*="absolute"]{position:static!important;left:auto!important;top:auto!important;width:auto!important;margin:0 0 16px!important}
+.page:not(.canvas) .content{overflow-x:auto}
 .content p{margin:0 0 .6em}
 .content img{max-width:100%;height:auto}
 .content table{border-collapse:collapse;margin:8px 0;max-width:100%}
@@ -1434,6 +1437,7 @@ PAGE_TEMPLATE = Template("""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="onenote-export" content="$export_meta">
 <title>$title_text</title>
 <style>$css</style>
 </head>
@@ -1501,6 +1505,7 @@ def render_page_html(e, section_name, body, created, modified, prev_e, next_e, e
         crumbs=crumbs, title=html.escape(e["title"]),
         created=html.escape(created), body=body, extra=extra,
         dates_style=dates_style, content_style=content_style,
+        export_meta=f'images={OPTS["html_images"]}',
         modified_span=("" if modified == created      # same moment: show it once
                        else f'<span><b>Modified</b>{html.escape(modified)}</span>'),
         prev=pager(prev_e, True), next=pager(next_e, False))
@@ -1628,12 +1633,57 @@ def section_json(section, entries):
 # --------------------------------------------------------------------------
 # Building and saving one page
 # --------------------------------------------------------------------------
-def prepare_html_body(content, prefix):
+MIME_BY_EXT = {".png": "image/png", ".jpg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp", ".bmp": "image/bmp", ".tif": "image/tiff",
+               ".svg": "image/svg+xml"}
+MAX_EMBED = 20 * 1024 * 1024        # larger pictures stay linked instead of embedded
+
+
+def embed_images(content, page_dir):
+    """Put the page's downloaded images into the HTML as data: URIs. Browsers (Safari in
+    particular) often refuse to load pictures that sit outside the folder of a local HTML
+    file, so a page that carries its images works wherever it is opened."""
+    def repl(m):
+        tag = m.group(0)
+        raw = attr(tag, "src")
+        if not raw or not raw.startswith("images/"):
+            return tag
+        path = os.path.join(page_dir, unquote(raw))
+        try:
+            if os.path.getsize(path) > MAX_EMBED:
+                return tag
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return tag
+        mime = MIME_BY_EXT.get(os.path.splitext(path)[1].lower(), "image/png")
+        uri = f"data:{mime};base64,{base64.b64encode(data).decode()}"
+        tag = re.sub(r'\sdata-fullres-src\s*=\s*"[^"]*"', "", tag)     # same picture, keep one copy
+        return re.sub(r'(?<![\w-])src\s*=\s*"[^"]*"', lambda _: f'src="{uri}"', tag, count=1)
+
+    return re.sub(r"<img\b[^>]*>", repl, content, flags=re.I | re.S)
+
+
+def html_images_outdated(e, html_path):
+    """True for a page whose html was written without embedded images (older versions) while
+    embedding is on: it is downloaded again so the html page can carry its pictures."""
+    if OPTS["html_images"] != "embed" or not os.path.isdir(os.path.join(e["dir"], "images")):
+        return False
+    try:
+        with open(html_path, encoding="utf-8") as f:
+            return 'content="images=embed"' not in f.read(4000)
+    except OSError:
+        return False
+
+
+def prepare_html_body(content, prefix, page_dir=None, embed=False):
     """Page HTML as shown in html/<seq>_<name>.html (the part inside <body>)."""
     # <object/> and <iframe/> are not void elements in HTML5: written self-closed they would
     # swallow the rest of the page, so expand them.
     content = re.sub(r"<(object|iframe)\b([^>]*?)\s*/>", r"<\1\2></\1>", content,
                      flags=re.I | re.S)
+    if embed and page_dir:
+        content = embed_images(content, page_dir)
     # image / attachment links are relative to the page folder; html/ lives next to pages/
     content = re.sub(r'((?<![\w-])(?:src|data-fullres-src|data)\s*=\s*")((?:images|attachments)/)',
                      lambda m: m.group(1) + prefix + m.group(2), content, flags=re.I)
@@ -1729,7 +1779,7 @@ def write_page_html(e, html_dir, section_name, prev_e, next_e, built):
     """Write html/<seq>_<name>.html (written last: its existence marks the page as complete).
     Returns (width, height) when the page was laid out on a canvas, else None."""
     prefix = "../pages/" + "/".join(quote(p) for p in e["rel_parts"]) + "/"
-    body = prepare_html_body(built["content"], prefix)
+    body = prepare_html_body(built["content"], prefix, e["dir"], OPTS["html_images"] == "embed")
     ink, canvas = built.get("ink"), None
     extra = page_class = page_style = extra_css = dates_style = content_style = ""
     if ink:
@@ -1890,7 +1940,8 @@ def export_section(sid, outdir=".", folder_name=None, notebook_link=None, only_p
                 cleanup_empty_ink(e["dir"])
             if (on_disk(e) and pid not in retry
                     and (rec is None or rec.get("folder") == rel_folder)
-                    and not ink_page_outdated(e, os.path.join(html_dir, e["html_name"]))):
+                    and not ink_page_outdated(e, os.path.join(html_dir, e["html_name"]))
+                    and not html_images_outdated(e, os.path.join(html_dir, e["html_name"]))):
                 if os.path.isdir(tmp_dir):
                     shutil.rmtree(tmp_dir)
                 e["stats"] = (rec or {}).get("stats") or stats_from_disk(e)
@@ -2236,12 +2287,15 @@ def main(argv=None):
     ap.add_argument("--utc", action="store_true", help="show dates in UTC instead of local time")
     ap.add_argument("--no-ink", action="store_true", help="do not request handwriting (InkML)")
     ap.add_argument("--ocr", action="store_true", help="OCR downloaded images with tesseract")
+    ap.add_argument("--html-images", choices=["embed", "link"], default="embed",
+                    help="html pages: embed = put the images inside the page file so they always "
+                         "show (default), link = refer to the files in pages/ (smaller html)")
     ap.add_argument("--ink-layout", choices=["canvas", "end"], default="canvas",
                     help="html pages with handwriting: canvas = draw it over the text boxes at "
                          "OneNote's positions (default), end = show it below the page text")
-    ap.add_argument("--render", choices=["auto", "all", "none"], default="auto",
-                    help="save pages as PDF/PNG: auto = pages with handwriting, OCR text or "
-                         "only images (default), all, none")
+    ap.add_argument("--render", choices=["auto", "all", "none"], default="none",
+                    help="save pages as PDF/PNG: none = no PDF/PNG export (default), auto = pages "
+                         "with handwriting, OCR text or only images, all = every page")
     ap.add_argument("--render-as", choices=["pdf", "png", "both"], default="pdf",
                     help="format of the saved page (default pdf)")
     args = ap.parse_args(argv)
@@ -2252,7 +2306,8 @@ def main(argv=None):
         return 1
     set_token(raw)
     OPTS.update(utc=args.utc, ink=not args.no_ink, ocr=args.ocr, render=args.render,
-                render_as=args.render_as, ink_layout=args.ink_layout)
+                render_as=args.render_as, ink_layout=args.ink_layout,
+                html_images=args.html_images)
 
     real_stdout = sys.stdout
     sys.stdout = Tee(real_stdout)
